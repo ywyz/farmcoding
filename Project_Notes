@@ -1,0 +1,938 @@
+# TFWR 12x12 自动化农场项目记录
+
+日期：2026-06-20
+
+## 项目目标
+
+这个项目用于 The Farmer Was Replaced 的 12x12 农场自动化。目标不是只刷某一种资源，而是让无人机持续维护多作物布局，自动种植、收获、浇水、施肥、排序仙人掌、种植向日葵、种植南瓜、种植胡萝卜/树/灌木，并通过灌木生成迷宫获取金币。
+
+当前策略已经从最初的“整场单作物轮作”改为“固定混合布局维护”。这样可以避免整场频繁 `clear()` 导致成熟作物被重置，也能保证每种植物都持续存在。
+
+## 重要游戏约束
+
+- 游戏语言类似 Python，但不是完整 Python。
+- 支持函数、`from import`、列表、字典、集合、循环、`break`、`continue` 等。
+- 没有三引号注释。
+- `move()` 越过边界会环绕。
+- `till()` 是切换地形：草地变土壤，土壤再调用会变回草地。
+- `harvest()` 如果用于不可收获或错误实体，可能会破坏实体，所以关键作物收获前要检查类型。
+- 草地会自动长出 `Entities.Grass`，所以不能只依赖 `get_entity_type() == None` 才种植。
+- `can_harvest()` 只能说明当前实体可收获，不代表它是目标作物。南瓜区曾经因为只判断 `can_harvest()`，把草误当南瓜收获成功。
+- `get_time()`、`get_tick_count()` 和 `quick_print()` 不消耗 tick，适合做日志和性能观察。
+- `do_a_flip()` 可以用作约 1 秒的等待动作；当前 `wait_two_seconds()` 调用两次。
+
+## 当前文件结构
+
+- `auto_farm.py`
+  - 游戏运行入口。
+  - 现在是薄入口：
+
+```python
+from farm_main import main
+
+main()
+```
+
+- `farm_main.py`
+
+  - 主循环。
+  - 负责建布局、循环维护、库存日志。
+- `farm_utils.py`
+
+  - 常量、布局坐标、移动、浇水、施肥、种植、解锁等工具。
+- `farm_zones.py`
+
+  - 各区域维护逻辑：南瓜、向日葵、仙人掌、迷宫灌木、补给区。
+- `__builtins__.py`
+
+  - 游戏内置函数类型提示文件，仅参考，不要修改。
+- `save.json`
+
+  - 游戏存档文件，不手动修改。
+
+## 当前布局
+
+当前脚本按固定区域维护 12x12 农场。
+
+### 南瓜区
+
+- 坐标：`x = 0..5`, `y = 0..5`
+- 大小：6x6
+- 目标：生成 6x6 巨型南瓜。
+- 常量：
+
+```python
+PUMPKIN_X0 = 0
+PUMPKIN_Y0 = 0
+PUMPKIN_SIZE = 6
+```
+
+### 向日葵区
+
+- 坐标：`x = 6..11`, `y = 0..1`
+- 大小：6x2，共 12 株。
+- 目标：保持至少 10 株，用最高花瓣收获以获得 bonus power。
+- 常量：
+
+```python
+SUNFLOWER_X0 = 6
+SUNFLOWER_Y0 = 0
+SUNFLOWER_W = 6
+SUNFLOWER_H = 2
+```
+
+### 仙人掌区
+
+- 坐标：`x = 8..11`, `y = 2..5`
+- 大小：4x4。
+- 目标：成熟后二维排序，触发连锁收获。
+- 常量：
+
+```python
+CACTUS_X0 = 8
+CACTUS_Y0 = 2
+CACTUS_W = 4
+CACTUS_H = 4
+```
+
+### 迷宫灌木点
+
+- 坐标：`(6, 2)`
+- 目标：种植灌木，成熟后使用 `Items.Weird_Substance` 生成迷宫，搜索宝藏并收金币。
+- 常量：
+
+```python
+MAZE_X = 6
+MAZE_Y = 2
+```
+
+### 补给区
+
+补给区是所有不属于南瓜、向日葵、仙人掌、迷宫灌木点的格子。
+
+当前按 y 坐标分配：
+
+- `coord_y < 8`：胡萝卜
+- `8 <= coord_y < 10`：树
+- `10 <= coord_y < 12`：灌木
+
+补给区会持续维护目标作物，成熟后收获并立即补种。
+
+## 当前核心逻辑
+
+### 主循环
+
+`farm_main.py` 中：
+
+```python
+def main():
+	build_mixed_layout()
+	while True:
+		print_inventory()
+		maintain_mixed_layout()
+```
+
+`build_mixed_layout()` 会先 `clear()`，然后依次维护各区：南瓜、向日葵、仙人掌、迷宫灌木、补给区。
+
+`maintain_mixed_layout()` 每轮维护全部区域。如果迷宫灌木成功收金币，会立刻重新调用 `build_mixed_layout()`，因为迷宫会破坏布局。
+
+### 南瓜
+
+南瓜区的关键修复：
+
+- 不能只看 `can_harvest()`，必须先确认 `get_entity_type() == Entities.Pumpkin`。
+- 先种满 6x6 南瓜，再尝试收获。
+- `quick_harvest_pumpkin()` 只用于已经是南瓜的格子。
+- 新增日志：`pumpkin_tiles <数量>`，种满时应接近 36。
+
+曾经的问题：清场后南瓜区是草地，草也可能 `can_harvest()`，程序误认为收获了南瓜，然后跳过南瓜种植。
+
+### 向日葵
+
+向日葵区会测量花瓣数：
+
+- 低于 `SUNFLOWER_REPLANT_PETALS = 11` 的向日葵会被重种。
+- 每轮最多重种 `SUNFLOWER_REPLANT_LIMIT = 2` 株，避免一直重种导致不够 10 株 bonus。
+- 维护日志：
+
+```text
+sunflower best <n> ready <n> kept <n> repl <n>
+```
+
+### 仙人掌
+
+仙人掌区会在全部成熟后排序。
+
+排序目标：
+
+- East 方向相邻仙人掌大小应大于等于当前。
+- North 方向相邻仙人掌大小应大于等于当前。
+- 满足二维非递减后，从西南角尝试收获触发连锁。
+
+相关日志：
+
+```text
+cactus_chain_harvest
+cactus_sort_failed
+cactus_maintain
+```
+
+### 迷宫金币
+
+流程在 `maintain_maze_bush_tile()`：
+
+1. 到 `(MAZE_X, MAZE_Y)`。
+2. 保持草地。
+3. 种 `Entities.Bush`。
+4. 浇水，必要时施肥。
+5. 灌木成熟后，用足量 `Items.Weird_Substance` 生成迷宫。
+6. 调用 `measure()` 获取宝藏坐标。
+7. 使用 DFS + `can_move()` 寻路。
+8. 到达 `Entities.Treasure` 后 `harvest()` 收金币。
+9. 成功后主循环立即重建布局。
+
+相关日志：
+
+```text
+maze_bush_plant
+maze_bush_grow
+maze_gold_harvest
+maze_search_fail
+maze_measure_fail
+maze_wait_substance
+```
+
+### 树、灌木、胡萝卜
+
+之前树和灌木没有稳定种植，根因是草地自动长草，程序清掉草后仍依赖 `get_entity_type() == None` 才种。
+
+现在新增了 `force_plant()`，清错后直接调用：
+
+```python
+plant(Entities.Tree)
+plant(Entities.Bush)
+plant(Entities.Carrot)
+plant(Entities.Pumpkin)
+```
+
+补给区新增日志：
+
+```text
+supply_tiles carrot <n> tree <n> bush <n>
+```
+
+如果这些值大于 0，说明主循环确实经过对应补给区域。
+
+## 当前调试日志重点
+
+运行时建议重点观察：
+
+```text
+pumpkin_tiles <n>
+supply_tiles carrot <n> tree <n> bush <n>
+sunflower best <n> ready <n> kept <n> repl <n>
+maze_gold_harvest
+cactus_chain_harvest
+mixed_loop sec <s> ticks <t>
+```
+
+期望：
+
+- `pumpkin_tiles` 最终应接近 36。
+- `supply_tiles` 中 carrot/tree/bush 都应大于 0。
+- `maze_gold_harvest` 出现后会立即重建布局。
+- `sunflower kept` 应尽量保持大于等于 10。
+
+## 已踩过的关键问题
+
+1. 整场单作物轮作会浪费大量时间。
+
+   - 已改成固定混合布局。
+2. 南瓜成熟后没有及时收获。
+
+   - 修复为优先检查南瓜类型后快速收获。
+3. 南瓜循环消失。
+
+   - 根因是草被 `can_harvest()` 误判为南瓜收获成功。
+   - 修复为收获前必须 `get_entity_type() == Entities.Pumpkin`。
+4. 树、灌木、南瓜不稳定种植。
+
+   - 根因是草地自动长草，清错后依赖 `None` 不可靠。
+   - 修复为清错后直接 `plant(target_entity)`。
+5. 迷宫会破坏布局。
+
+   - 修复为迷宫金币收获后立即 `build_mixed_layout()`。
+6. 没有所谓安全库存。
+
+   - 用户明确要求每种植物都要持续种植。
+   - 已移除 `SAFE_HAY / SAFE_WOOD / SAFE_CARROT` 等策略。
+
+## 后续可优化方向
+
+1. 进一步验证南瓜区是否总能达到 `pumpkin_tiles 36`。
+2. 如果树和灌木仍然视觉上很少，可以扩大树/灌木条带，缩小仙人掌或向日葵区域。
+3. 如果迷宫耗时太高，可以降低迷宫运行频率，例如每 N 轮才尝试一次。
+4. 如果肥料消耗太快，可以提高 `FERTILIZER_MIN`。
+5. 如果向日葵重种太频繁，可以降低 `SUNFLOWER_REPLANT_PETALS` 或 `SUNFLOWER_REPLANT_LIMIT`。
+6. 如果仙人掌排序失败，可先缩小仙人掌区到 3x3，再确认排序逻辑。
+7. 如果游戏实际 `from import` 行为和 Python 不完全一致，可以把模块重新合并为单文件，但当前已经按用户确认的 from import 设计拆分。
+
+## 当前入口
+
+游戏里运行：
+
+```python
+auto_farm.py
+```
+
+文件内容应为：
+
+```python
+from farm_main import main
+
+main()
+```
+
+这会进入 `farm_main.main()`，再调用各模块维护逻辑。
+
+## 下次快速接手清单
+
+下一次打开游戏或继续调脚本时，建议按这个顺序确认：
+
+1. 先运行 `auto_farm.py`。
+2. 看输出里是否有 `layout_build`。
+3. 看输出里是否持续出现 `mixed_loop`。
+4. 看 `pumpkin_tiles` 是否逐步接近 36。
+5. 看 `supply_tiles carrot <n> tree <n> bush <n>` 三个数量是否都大于 0。
+6. 看向日葵日志里 `kept` 是否大于等于 10。
+7. 看是否出现 `maze_gold_harvest`。出现后应马上重新 `layout_build`。
+8. 如果某一类作物没出现，优先检查对应区域函数，而不是先改主循环。
+
+## 坐标和方向速查
+
+- 起点是 `(0, 0)`。
+- `x` 向 East 增加。
+- `y` 向 North 增加。
+- `move()` 越界会环绕，所以地图是环面。
+- `North` 是上，`East` 是右，`South` 是下，`West` 是左。
+- `go_to(x, y)` 会使用环绕距离移动，不是单纯从边界绕远路。
+
+## 常用 API 速查
+
+### 移动和位置
+
+```python
+move(North)
+can_move(East)
+get_pos_x()
+get_pos_y()
+get_world_size()
+```
+
+### 实体和地形
+
+```python
+get_entity_type()
+get_ground_type()
+till()
+plant(Entities.Pumpkin)
+plant(Entities.Carrot)
+plant(Entities.Sunflower)
+plant(Entities.Cactus)
+plant(Entities.Tree)
+plant(Entities.Bush)
+harvest()
+can_harvest()
+```
+
+### 水和肥料
+
+```python
+get_water()
+use_item(Items.Water)
+use_item(Items.Fertilizer)
+use_item(Items.Weird_Substance, amount)
+```
+
+### 库存和解锁
+
+```python
+num_items(Items.Carrot)
+num_unlocked(Unlocks.Mazes)
+get_cost(Entities.Pumpkin)
+unlock(Unlocks.Speed)
+```
+
+### 测量
+
+```python
+measure()
+measure(North)
+```
+
+- 向日葵：`measure()` 返回花瓣数。
+- 仙人掌：`measure()` 返回大小，范围一般是 0..9。
+- 迷宫：`measure()` 返回宝藏坐标。
+
+## 作物规则速查
+
+### 草
+
+- 草会在草地上自动生长。
+- 草可以直接收获获得 Hay。
+- 因为草会自动出现，种植其它作物时不能依赖 `get_entity_type() == None`。
+
+### 胡萝卜
+
+- 必须种在土壤上。
+- 种植语句：
+
+```python
+plant(Entities.Carrot)
+```
+
+- 需要先 `ensure_soil()` 或手动 `till()`。
+
+### 树
+
+- 可以种在草地或土壤，但脚本里按草地作物维护。
+- 树比灌木获取木材效率更高，每棵树能提供 5 份木材。
+- 种植语句：
+
+```python
+plant(Entities.Tree)
+```
+
+- 正交相邻树会变慢：North/East/South/West 每相邻一棵树，生长时间翻倍。
+- 如果四个正交方向全是树，生长时间会变成 `2*2*2*2 = 16` 倍。
+- 树不能密集连片，下一版布局应使用棋盘或间隔布局。
+
+### 混合种植
+
+- 有伴生属性的植物只有 `Entities.Grass`、`Entities.Bush`、`Entities.Tree`、`Entities.Carrot`。
+- `get_companion()` 返回：
+
+```python
+plant_type, (x, y) = get_companion()
+```
+
+- 如果当前格没有伴生属性，`get_companion()` 返回 `None`。
+- 伴生植物类型会和当前植物不同。
+- 伴生坐标随机出现在当前植物周围三步范围内。
+- 坐标会考虑地图环绕，例如 `(0,0)` 的伴生目标可能在农场另一边。
+- 伴生植物不需要成熟，只要目标坐标上种着对应植物，原植物收获时就能获得加成。
+- 混合种植解锁前加成倍率是 5，之后每次升级倍率会提高。
+- 下一版布局模块应让 companion 只影响基础混合区，不应让 companion 改写南瓜、仙人掌、向日葵、迷宫灌木专用区。
+
+### 灌木
+
+- 可以种在草地或土壤，但脚本里按草地作物维护。
+- 种植语句：
+
+```python
+plant(Entities.Bush)
+```
+
+- 对灌木使用 Weird Substance 可以生成迷宫。
+
+### 南瓜
+
+- 必须种在土壤上。
+- 枯萎南瓜 `Entities.Dead_Pumpkin` 上 `can_harvest()` 永远是 False。
+- 发现枯萎南瓜时直接重新 `plant(Entities.Pumpkin)` 覆盖，不要靠收获处理。
+- 收获前必须确认：
+
+```python
+get_entity_type() == Entities.Pumpkin
+```
+
+不能只看 `can_harvest()`。
+
+### 向日葵
+
+- 必须种在土壤上。
+- 至少 10 株时，收获最高花瓣向日葵有 bonus。
+- 当前脚本低于 11 花瓣会考虑重种，但每轮最多重种 2 株。
+
+### 仙人掌
+
+- 必须种在土壤上。
+- `measure()` 返回大小。
+- 排序规则：East/North 应大于等于当前，West/South 应小于等于当前。
+- 满足排序后收一株可以连锁收获。
+
+### 恐龙
+
+- 解锁恐龙后可以通过恐龙帽养殖远古骨头。
+- 装备恐龙帽：
+
+```python
+change_hat(Hats.Dinosaur_Hat)
+```
+
+- 装备恐龙帽且有足够仙人掌时，系统会自动购买一颗 `Entities.Apple` 并放在无人机下方。
+- 无人机站在苹果上并再次移动时会吃掉苹果，尾巴增长一节。
+- 如果还有足够仙人掌，新的苹果会被购买并随机放置在一个位置。
+- 如果苹果生成位置已有其它实体，则苹果无法生成。
+- 在苹果上调用 `measure()` 会返回下一颗苹果的位置：
+
+```python
+next_x, next_y = measure()
+```
+
+- 恐龙尾巴会拖在无人机身后，填满无人机之前经过的格子。
+- 如果无人机尝试移动到尾巴上，`move()` 会失败并返回 `False`。
+- 尾巴最后一节会在移动过程中移开，所以可以移动到它刚离开的位置。
+- 如果尾巴填满整个农场，无人机将无法再移动；可以通过无法移动判断尾巴接近最大。
+- 戴恐龙帽时，无人机不能越过农场边界环绕到另一边。
+- 卸下恐龙帽会收获尾巴，获得 `tail_length * tail_length` 个 `Items.Bone`。
+- 示例收益：长度 16 得 256 骨头，长度 100 得 10000 骨头。
+- 恐龙帽很重，初始 `move()` 成本为 400 ticks，而不是普通 200 ticks。
+- 每吃一颗苹果，移动 tick 成本减少约 3%，向下取整。
+- 只有一顶恐龙帽，因此同一时间只有一架无人机能佩戴。
+
+恐龙模式重要注意：
+
+- 恐龙帽会改变移动规则：没有边界环绕，且尾巴会阻挡移动。
+- 恐龙模式不应直接混进现有混合农场维护循环。
+- 恐龙模式应作为独立模式运行：先准备空场或专用区域，再 `change_hat(Hats.Dinosaur_Hat)`，吃苹果增长尾巴，最后换回普通帽子收骨头。
+- 恐龙依赖仙人掌购买苹果，所以应先保证仙人掌供应。
+- 如果现有农场种满作物，苹果随机生成可能失败；恐龙模式最好在 `clear()` 后或专门空地中运行。
+
+## 迷宫知识速查
+
+生成迷宫需要：
+
+```python
+plant(Entities.Bush)
+use_item(Items.Weird_Substance, amount)
+```
+
+全场迷宫所需数量当前按：
+
+```python
+amount = get_world_size() * 2 ** (num_unlocked(Unlocks.Mazes) - 1)
+```
+
+脚本里为了保持语法简单，用循环乘 2 计算。
+
+迷宫中：
+
+- `get_entity_type() == Entities.Hedge` 表示树篱。
+- `get_entity_type() == Entities.Treasure` 表示宝藏。
+- `measure()` 返回宝藏坐标。
+- `can_move(direction)` 可以判断是否有墙。
+- 收到金币后迷宫会破坏原布局，所以必须重建布局。
+
+## 计时和性能知识
+
+- `get_time()` 返回游戏开始以来的秒数。
+- `get_tick_count()` 返回当前程序消耗的 tick 数。
+- `quick_print()` 不消耗 tick，适合日志。
+- `print()` 很慢，不适合调试循环。
+- `do_a_flip()` 可用作等待动作，但它本身花时间，不能在每个格子都用。
+
+当前计时日志格式：
+
+```text
+<name> sec <秒数> ticks <tick数>
+```
+
+重要日志名：
+
+- `layout_build`
+- `mixed_loop`
+- `pumpkin_quick_harvest`
+- `pumpkin_scan_harvest`
+- `pumpkin_wait`
+- `sunflower_harvest`
+- `cactus_chain_harvest`
+- `maze_gold_harvest`
+- `supply_maintain`
+
+## 当前可调参数
+
+主要在 `farm_utils.py` 顶部：
+
+```python
+DEBUG = True
+WATER_LOW = 0.50
+WATER_HIGH = 0.75
+FERTILIZER_MIN = 20
+SUNFLOWER_REPLANT_PETALS = 11
+SUNFLOWER_REPLANT_LIMIT = 2
+```
+
+调参建议：
+
+- 肥料消耗太快：调高 `FERTILIZER_MIN`。
+- 向日葵重种太频繁：降低 `SUNFLOWER_REPLANT_PETALS` 或 `SUNFLOWER_REPLANT_LIMIT`。
+- 日志太多：把 `DEBUG = False`。
+- 水消耗太快：降低 `WATER_LOW` / `WATER_HIGH`。
+
+布局参数也在 `farm_utils.py` 顶部：
+
+```python
+PUMPKIN_X0, PUMPKIN_Y0, PUMPKIN_SIZE
+SUNFLOWER_X0, SUNFLOWER_Y0, SUNFLOWER_W, SUNFLOWER_H
+CACTUS_X0, CACTUS_Y0, CACTUS_W, CACTUS_H
+MAZE_X, MAZE_Y
+```
+
+如果想增加树/灌木面积，优先改 `maintain_supply_tile()` 的 y 坐标分配。
+
+## 代码维护原则
+
+1. 不要修改 `__builtins__.py`。
+2. 不要手动改 `save.json`。
+3. 先改模块，再让 `auto_farm.py` 继续保持薄入口。
+4. 关键作物收获前必须先判断实体类型。
+5. 草地自动长草，所以清错后应直接 `plant(target_entity)`。
+6. 迷宫收金币后必须重建布局。
+7. 不要在每个格子上使用 `do_a_flip()`，等待应按区域而不是按格子。
+8. 如果 `from import` 在游戏里出问题，再考虑把模块合并回单文件。
+
+## 下一次最可能要继续处理的问题
+
+1. 确认 `pumpkin_tiles` 是否稳定到 36。
+2. 确认 `supply_tiles` 中 tree/bush 是否大于 0，并观察地图上是否真的有树和灌木。
+3. 确认 `maze_gold_harvest` 后是否立刻 `layout_build`。
+4. 如果迷宫太频繁破坏农场，可以给 `maintain_maze_bush_tile()` 加轮次冷却。
+5. 如果南瓜收益仍低，可以暂停迷宫，先稳定南瓜区。
+6. 如果树/灌木因为成熟立刻被收而看起来少，可以改成隔几轮收获一次，而不是成熟就收。
+7. 如果仙人掌 `cactus_sort_failed` 经常出现，可以把 4x4 改成 3x3 验证排序。
+
+## 下一阶段需要完成的步骤
+
+以下是下一轮继续开发时应优先完成的事项。
+
+### 1. 新增农场布局模块
+
+当前布局常量和区域判断还放在 `farm_utils.py` 中，下一阶段应新增独立模块，例如：
+
+```python
+farm_layout.py
+```
+
+建议职责：
+
+- 集中定义所有区域坐标和尺寸。
+- 提供 `zone_at(x, y)`，返回当前格子属于南瓜、向日葵、仙人掌、迷宫灌木、胡萝卜、树、灌木、草地中的哪一种。
+- 提供 `target_entity_at(x, y)`，返回该格子的目标作物。
+- 提供布局调试函数，例如统计各作物格数量。
+- 后续切换布局时，只改 `farm_layout.py`，不改主循环。
+
+布局需要结合两个机制重新设计：
+
+1. 混合种植。
+2. 树的正交相邻减速规则。
+
+#### 混合种植考虑
+
+`get_companion()` 只对草、灌木、树、胡萝卜有意义。下一阶段可以建立“基础作物混合区”，而不是简单按 y 坐标切条带。
+
+伴生目标坐标可能因为地图环绕出现在农场另一边，所以布局模块需要用 `wrap()` 或等价逻辑判断目标是否仍属于基础混合区。
+
+可行方案：
+
+- 固定一片 6x6 或 6x4 作为基础混合区。
+- 初始按树/灌木/胡萝卜/草交错种植。
+- 每轮读取 `get_companion()`，如果伴生目标落在混合区内，就把目标格改成对应作物。
+- 不要让 companion 修改南瓜、仙人掌、向日葵、迷宫灌木专用区。
+
+#### 树的布局要求
+
+树的 North/East/South/West 相邻位置如果也有树，会降低生长速度。因此树不应密集连片种植。
+
+布局模块应提供一个 `tree_allowed_at(x, y)` 之类的判断，确保目标树位的正交邻居不是树位。
+
+推荐方案：
+
+- 用棋盘布局放树：例如 `(x + y) mod 2 == 0` 的部分格子种树。
+- 树之间尽量隔开至少一个正交格。
+- 树周围可放胡萝卜、灌木或草，既避免树减速，也给混合种植留空间。
+
+### 2. 修改向日葵策略：不再只收最高花瓣，改为全部收获
+
+当前向日葵逻辑会测花瓣并优先收最高花瓣。下一阶段要改为：
+
+- 向日葵区所有成熟向日葵都收获。
+- 收获后立即补种。
+- 可保留 `measure()` 日志，但不再用它决定是否跳过低花瓣。
+- 可删除或禁用低花瓣重种逻辑：`SUNFLOWER_REPLANT_PETALS`、`SUNFLOWER_REPLANT_LIMIT`。
+
+原因：
+
+- 选择最高花瓣需要多次扫描和比较，成本高。
+- 当前目标是综合自动化，而不是极限 Power 收益。
+- 全部收获更稳定，不会出现低花瓣长期占格的问题。
+
+建议新函数逻辑：
+
+```python
+def maintain_sunflower_zone():
+  for each sunflower tile:
+    ensure soil
+    if empty or wrong entity:
+      plant sunflower
+    water
+    if can_harvest and entity is sunflower:
+      harvest
+      plant sunflower
+```
+
+注意：收获前仍应确认 `get_entity_type() == Entities.Sunflower`，避免像南瓜一样误收草或其它实体。
+
+### 3. 思考仙人掌排序算法
+
+仙人掌排序目标是二维非递减：
+
+- East 邻居大小 >= 当前。
+- North 邻居大小 >= 当前。
+- 等价于从 South-West 到 North-East 逐渐变大。
+
+当前实现是横向 pass + 纵向 pass 的局部冒泡法。可继续，但要评估效率和正确性。
+
+可选算法：
+
+#### 方案 A：二维冒泡排序
+
+当前方向。
+
+做法：
+
+- 横向扫描，若当前 > East，则 `swap(East)`。
+- 纵向扫描，若当前 > North，则 `swap(North)`。
+- 重复若干轮直到全区 sorted。
+
+优点：
+
+- 实现简单。
+- 只需要相邻 `swap()`。
+- 适合 3x3 或 4x4 小区。
+
+缺点：
+
+- 不一定最快。
+- 如果局部交换导致横纵相互破坏，需要较多 pass。
+
+#### 方案 B：一维蛇形排序映射
+
+把仙人掌区映射为一维序列，按从 South-West 到 North-East 的顺序排序。
+
+做法：
+
+- 扫描全部仙人掌，记录 size。
+- 目标序列从小到大。
+- 用相邻 swap 把较小值逐步冒泡到前面。
+- 行内方向可以按蛇形减少移动成本。
+
+优点：
+
+- 思路接近普通排序。
+- 最终如果按行列递增，能满足 East/North 条件。
+
+缺点：
+
+- 需要维护坐标到序列 index 的映射。
+- 实现更复杂。
+
+#### 方案 C：计数排序 + 目标填充
+
+因为仙人掌大小只有 0..9，可以统计每个大小数量。
+
+做法：
+
+- 统计 0..9 各数量。
+- 生成目标矩阵。
+- 对每个格子查找应交换来的大小。
+- 用相邻 swap 移动目标 cactus。
+
+优点：
+
+- 理论上排序目标清晰。
+- 适合大小范围固定的仙人掌。
+
+缺点：
+
+- 找目标和移动路径复杂。
+- TFWR 字典/列表操作也有 tick 成本。
+
+建议下一步：先保留方案 A，但把仙人掌区缩小到 3x3 做稳定性验证。如果 `cactus_chain_harvest` 稳定，再扩大到 4x4。
+
+### 4. 思考迷宫寻宝算法
+
+当前迷宫使用 DFS：
+
+- `measure()` 得到宝藏坐标。
+- `can_move(direction)` 判断墙。
+- 用 `visited` 字典避免重复探索。
+- 用 `backtrack` 栈回退。
+
+可选算法：
+
+#### 方案 A：DFS 继续使用
+
+优点：
+
+- 实现简单。
+- 适合无环迷宫。
+- 已经有代码。
+
+缺点：
+
+- 如果重复使用迷宫产生循环，DFS 可能走很多冤枉路。
+- 不保证最短路径。
+
+#### 方案 B：BFS 最短路
+
+做法：
+
+- 从当前位置开始广度搜索。
+- 记录父节点。
+- 找到宝藏后按父节点回放路径。
+
+优点：
+
+- 能找到较短路径。
+- 对循环迷宫更稳。
+
+缺点：
+
+- 队列和父节点字典操作多，tick 成本高。
+- 实现复杂。
+
+#### 方案 C：目标导向 DFS
+
+根据 `measure()` 的目标坐标，优先尝试更接近宝藏的方向。
+
+做法：
+
+- 计算当前坐标到目标坐标的环绕距离。
+- 优先尝试能减少距离的方向。
+- 如果撞墙，再尝试其它方向。
+
+优点：
+
+- 比普通 DFS 更少绕路。
+- 保留 DFS 的简单结构。
+
+缺点：
+
+- 不是最短路保证。
+- 需要小心环绕坐标。
+
+建议下一步：把当前 DFS 改成目标导向 DFS，优先朝宝藏方向走；如果仍慢，再考虑 BFS。
+
+### 5. 思考围绕农场种植算法
+
+“围绕农场种植”可以理解为利用地图环绕和蛇形扫描，让无人机少走路、不断维护所有区域。
+
+当前是按区域维护：南瓜 -> 向日葵 -> 仙人掌 -> 迷宫 -> 补给。
+
+可改进为统一巡田路线：
+
+#### 方案 A：全图蛇形扫描
+
+每轮从 `(0,0)` 开始按蛇形扫完整个 12x12。
+
+每个格子调用：
+
+```python
+zone = zone_at(x, y)
+handle_zone_tile(zone)
+```
+
+优点：
+
+- 路径稳定。
+- 不会漏区。
+- 易于结合布局模块。
+
+缺点：
+
+- 对南瓜、仙人掌这种需要区域整体判断的作物不够高效。
+
+#### 方案 B：区域优先 + 局部蛇形
+
+保留当前区域顺序，但每个区域内部用蛇形路径。
+
+优点：
+
+- 兼顾区域特殊逻辑。
+- 比到处 `go_to()` 更少移动。
+
+缺点：
+
+- 需要为每个矩形区域写扫描工具。
+
+#### 方案 C：事件优先
+
+根据作物成熟时间和日志动态决定下一步去哪里。
+
+优点：
+
+- 理论效率最高。
+
+缺点：
+
+- 需要状态管理，复杂度明显上升。
+
+建议下一步：新增 `farm_layout.py` 后，实现一个通用 `scan_rect(x0, y0, w, h, handler)`，先把区域内部移动优化掉。不要一开始就做复杂事件调度。
+
+### 6. 新增恐龙骨头模式
+
+恐龙模式应该独立于当前混合农场维护模式。原因：
+
+- 戴恐龙帽后不能边界环绕，和当前 `go_to()` 的环绕移动假设冲突。
+- 尾巴会阻挡移动，需要类似贪吃蛇的路径规划。
+- 苹果生成需要空地，当前混合农场种满作物会降低苹果生成成功率。
+- 恐龙吃苹果消耗仙人掌，因此应先保证仙人掌产量。
+
+建议恐龙模式步骤：
+
+1. 确认 `num_items(Items.Cactus)` 足够。
+2. 暂停常规混合布局。
+3. `clear()` 清空农场，给苹果生成留空间。
+4. `change_hat(Hats.Dinosaur_Hat)`。
+5. 如果当前格是苹果，用 `measure()` 读取下一颗苹果坐标。
+6. 用非环绕路径移动到苹果位置，避免撞尾巴。
+7. 重复吃苹果，直到 `can_move()` 大面积失败或达到目标长度。
+8. `change_hat(Hats.Straw_Hat)` 或其它普通帽子，卸下恐龙帽收骨头。
+9. 调用 `build_mixed_layout()` 恢复农场。
+
+可选恐龙路径算法：
+
+#### 方案 A：固定蛇形填满农场
+
+- 清场后按蛇形路径走完整个农场。
+- 不依赖苹果位置强行追逐，而是让路径覆盖大部分格子。
+- 如果苹果在路径上，会自然吃到。
+- 简单稳定，但吃苹果速度可能不高。
+
+#### 方案 B：目标导向寻苹果
+
+- 在苹果上 `measure()` 获取下一颗苹果位置。
+- 使用非环绕曼哈顿路径靠近苹果。
+- 每次移动前检查 `can_move(direction)`，如果被尾巴挡住就换方向。
+- 比固定蛇形更主动，但需要处理尾巴死路。
+
+#### 方案 C：安全蛇形 + 局部偏移
+
+- 主体沿蛇形安全路径前进。
+- 如果苹果在附近，短距离偏移吃苹果。
+- 吃完回到蛇形路径。
+- 平衡稳定性和收益，但实现复杂。
+
+建议下一步先做方案 A，验证恐龙帽、苹果、骨头收益完整闭环，再考虑追苹果优化。
+
+## 下一阶段建议提交顺序
+
+1. 新建 `farm_layout.py`，迁移布局常量和 `is_*_zone()`。
+2. 实现 `zone_at(x, y)` 和 `target_entity_at(x, y)`。
+3. 重写补给区为混合种植 + 树不相邻布局。
+4. 简化向日葵：全部成熟即收，收后立刻补种。
+5. 把仙人掌区先缩到 3x3，验证二维冒泡排序。
+6. 把迷宫 DFS 改成目标导向 DFS。
+7. 添加 `scan_rect()`，优化区域内部巡田路线。
+8. 新增独立恐龙模式：先清场，装备恐龙帽，使用非环绕蛇形路径吃苹果，卸帽收骨头，再重建混合农场。
