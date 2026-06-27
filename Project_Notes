@@ -1,10 +1,15 @@
-# TFWR 12x12 自动化农场项目记录
+# TFWR 16x16 自动化农场项目记录
 
 日期：2026-06-20
 
+## 文档治理
+
+- 本文件 `project_notes.md` 是唯一事实源和唯一持续维护文档。
+- `Project_Note.md` 不再作为系统保存与维护目标。
+
 ## 项目目标
 
-这个项目用于 The Farmer Was Replaced 的 12x12 农场自动化。目标不是只刷某一种资源，而是让无人机持续维护多作物布局，自动种植、收获、浇水、施肥、排序仙人掌、种植向日葵、种植南瓜、种植胡萝卜/树/灌木，并通过灌木生成迷宫获取金币。
+这个项目用于 The Farmer Was Replaced 的 16x16 农场自动化。目标不是只刷某一种资源，而是让无人机持续维护多作物布局，自动种植、收获、浇水、施肥、排序仙人掌、种植向日葵、种植南瓜、种植胡萝卜/树/灌木，并通过灌木生成迷宫获取金币。
 
 当前策略已经从最初的“整场单作物轮作”改为“固定混合布局维护”。这样可以避免整场频繁 `clear()` 导致成熟作物被重置，也能保证每种植物都持续存在。
 
@@ -52,7 +57,7 @@ main()
 
 ## 当前布局
 
-当前脚本按固定区域维护 12x12 农场。
+当前脚本按固定区域维护 16x16 农场。
 
 ### 南瓜区
 
@@ -64,21 +69,21 @@ main()
 ```python
 PUMPKIN_X0 = 0
 PUMPKIN_Y0 = 0
-PUMPKIN_SIZE = 6
+PUMPKIN_SIZE = 8
 ```
 
 ### 向日葵区
 
 - 坐标：`x = 6..11`, `y = 0..1`
 - 大小：6x2，共 12 株。
-- 目标：保持至少 10 株，用最高花瓣收获以获得 bonus power。
+- 目标：成熟即收、收后立即补种，优先稳定产出与维护成本。
 - 常量：
 
 ```python
-SUNFLOWER_X0 = 6
+SUNFLOWER_X0 = 8
 SUNFLOWER_Y0 = 0
-SUNFLOWER_W = 6
-SUNFLOWER_H = 2
+SUNFLOWER_W = 8
+SUNFLOWER_H = 4
 ```
 
 ### 仙人掌区
@@ -89,8 +94,8 @@ SUNFLOWER_H = 2
 - 常量：
 
 ```python
-CACTUS_X0 = 8
-CACTUS_Y0 = 2
+CACTUS_X0 = 12
+CACTUS_Y0 = 4
 CACTUS_W = 4
 CACTUS_H = 4
 ```
@@ -102,8 +107,8 @@ CACTUS_H = 4
 - 常量：
 
 ```python
-MAZE_X = 6
-MAZE_Y = 2
+MAZE_X = 8
+MAZE_Y = 8
 ```
 
 ### 补给区
@@ -136,6 +141,8 @@ def main():
 
 `maintain_mixed_layout()` 每轮维护全部区域。如果迷宫灌木成功收金币，会立刻重新调用 `build_mixed_layout()`，因为迷宫会破坏布局。
 
+当前迷宫维护增加冷却：默认每 `N=3` 轮才尝试一次迷宫维护，降低对布局的频繁破坏。
+
 ### 南瓜
 
 南瓜区的关键修复：
@@ -149,14 +156,15 @@ def main():
 
 ### 向日葵
 
-向日葵区会测量花瓣数：
+向日葵策略已简化为稳定流：
 
-- 低于 `SUNFLOWER_REPLANT_PETALS = 11` 的向日葵会被重种。
-- 每轮最多重种 `SUNFLOWER_REPLANT_LIMIT = 2` 株，避免一直重种导致不够 10 株 bonus。
+- 每个格子保证是向日葵并维持土壤/水肥。
+- 只要该格向日葵成熟就立即收获，并立即补种。
+- 收获前依然检查 `get_entity_type() == Entities.Sunflower`。
 - 维护日志：
 
 ```text
-sunflower best <n> ready <n> kept <n> repl <n>
+sunflower ready <n> harvested <n>
 ```
 
 ### 仙人掌
@@ -223,6 +231,12 @@ supply_tiles carrot <n> tree <n> bush <n>
 
 如果这些值大于 0，说明主循环确实经过对应补给区域。
 
+补给区规则统一为：
+
+- `coord_y < 8`：胡萝卜
+- `8 <= coord_y < 10`：树
+- `10 <= coord_y < 12`：灌木
+
 ## 当前调试日志重点
 
 运行时建议重点观察：
@@ -230,7 +244,7 @@ supply_tiles carrot <n> tree <n> bush <n>
 ```text
 pumpkin_tiles <n>
 supply_tiles carrot <n> tree <n> bush <n>
-sunflower best <n> ready <n> kept <n> repl <n>
+sunflower ready <n> harvested <n>
 maze_gold_harvest
 cactus_chain_harvest
 mixed_loop sec <s> ticks <t>
@@ -241,7 +255,7 @@ mixed_loop sec <s> ticks <t>
 - `pumpkin_tiles` 最终应接近 36。
 - `supply_tiles` 中 carrot/tree/bush 都应大于 0。
 - `maze_gold_harvest` 出现后会立即重建布局。
-- `sunflower kept` 应尽量保持大于等于 10。
+- `sunflower harvested` 应持续大于 0（成熟即收逻辑正常）。
 
 ## 已踩过的关键问题
 
@@ -556,17 +570,19 @@ amount = get_world_size() * 2 ** (num_unlocked(Unlocks.Mazes) - 1)
 
 ```python
 DEBUG = True
+PARALLEL_ENABLED = False
+ENABLE_SUPPLY_PARALLEL = False
 WATER_LOW = 0.50
 WATER_HIGH = 0.75
 FERTILIZER_MIN = 20
-SUNFLOWER_REPLANT_PETALS = 11
-SUNFLOWER_REPLANT_LIMIT = 2
+MAZE_COOLDOWN_LOOPS = 3
 ```
 
 调参建议：
 
 - 肥料消耗太快：调高 `FERTILIZER_MIN`。
-- 向日葵重种太频繁：降低 `SUNFLOWER_REPLANT_PETALS` 或 `SUNFLOWER_REPLANT_LIMIT`。
+- 迷宫触发过于频繁：提高 `MAZE_COOLDOWN_LOOPS`。
+- 要测试并行补给：打开 `PARALLEL_ENABLED` 和 `ENABLE_SUPPLY_PARALLEL`。
 - 日志太多：把 `DEBUG = False`。
 - 水消耗太快：降低 `WATER_LOW` / `WATER_HIGH`。
 
@@ -591,6 +607,145 @@ MAZE_X, MAZE_Y
 6. 迷宫收金币后必须重建布局。
 7. 不要在每个格子上使用 `do_a_flip()`，等待应按区域而不是按格子。
 8. 如果 `from import` 在游戏里出问题，再考虑把模块合并回单文件。
+
+## 多无人机并行设计（当前实现边界）
+
+- 已加入并行开关，默认关闭：
+  - `PARALLEL_ENABLED`
+  - `ENABLE_SUPPLY_PARALLEL`
+  - `ENABLE_PUMPKIN_PARALLEL`
+  - `ENABLE_SUNFLOWER_PARALLEL`
+- 已加入灰度级别配置：
+  - `PARALLEL_ROLLOUT_LEVEL = 0`：串行
+  - `PARALLEL_ROLLOUT_LEVEL = 1`：`supply-only`
+  - `PARALLEL_ROLLOUT_LEVEL = 2`：`supply+pumpkin`
+  - `PARALLEL_ROLLOUT_LEVEL = 3`：`supply+pumpkin+sunflower`
+- 现有 `ENABLE_*` 布尔开关仍保留，可用于单独覆写某一并行区域。
+- 当前仅实现补给区并行入口，按行分片并分发任务。
+- 并行运行时会输出无人机调度日志：`drone_spawn`、`drone_tasks_inflight`。
+- 串行保留区：迷宫、仙人掌排序与链收、解锁流程。
+- 竞态规避原则：同一轮次同一地块只允许一个无人机写操作。
+
+### 巨型农场多无人机规则（已解锁能力）
+
+1. 基础规则
+
+- 初始只有一架无人机。
+- 额外无人机必须通过 `spawn_drone(function)` 生成。
+- 新无人机在调用 `spawn_drone` 的当前位置生成，执行完指定函数后自动消失。
+- 所有无人机地位相同，没有“主无人机”。任何无人机都可以再生成无人机。
+- 无人机之间不会碰撞。
+
+2. 数量与状态 API
+
+- `max_drones()`：可同时存在无人机上限。
+- `num_drones()`：当前农场中无人机数量。
+- 当达到上限时，`spawn_drone()` 返回 `None`。
+
+3. 常用并行模式
+
+- 可生成就分发，不能生成就本机执行：
+
+```python
+if not spawn_drone(task):
+	task()
+```
+
+- 行级并行（典型 for_all 结构）适合全图重复操作。
+
+4. 等待与句柄
+
+- `spawn_drone()` 返回 drone 句柄。
+- `wait_for(drone)` 等待目标无人机完成并返回其函数返回值。
+- `has_finished(drone)` 可非阻塞检查完成状态。
+
+5. 无共享内存
+
+- 每架无人机有自己的全局变量副本。
+- 子无人机修改其全局变量不会影响其他无人机。
+
+6. 竞态条件（必须重点规避）
+
+- 多无人机可在同一 tick 交互同一地块，最终结果取决于执行先后顺序。
+- 高风险操作组合：
+  - `use_item(Items.Fertilizer)` 与 `harvest()` 在同一格并发。
+  - `if get_water() < x: use_item(Items.Water)` 在同一格并发导致重复浇水浪费。
+- 当前项目执行策略：单写者原则（同一轮次同一地块只允许一个无人机执行写操作）。
+
+7. 工程约束
+
+- `spawn_drone()` 有明显 tick 成本，不按单格 spawn。
+- 优先按行块/子区域分片。
+- 并行必须有可回退串行路径。
+
+8. 当前竞态风险日志
+
+- `race_risk water <count> tile <x> <y> drones <n>`：并行开启且多无人机存在时，该格执行浇水写入。
+- `race_risk fert <count> tile <x> <y> drones <n>`：并行开启且多无人机存在时，该格执行施肥写入。
+- `write_conflict_plan pumpkin <n>`：南瓜并行任务分配前，计划写坐标重复数。
+- `write_conflict_plan sunflower <n>`：向日葵并行任务分配前，计划写坐标重复数。
+- `write_conflict_plan supply <n>`：补给区并行任务分配前，计划写坐标重复数。
+- 这些日志是轻量风险命中日志，不代表一定发生了错误顺序，只表示该写入在并行条件下存在重复写入风险。
+
+说明：`write_conflict_plan` 是“计划阶段检测”，用于确认任务切分本身没有把同一格分配给多个写者。理想值应为 `0`。
+
+无人机辅助函数（`farm_utils.py`）：
+
+- `safe_spawn(task, arg0=None, arg1=None)`
+- `run_or_spawn(task, arg0=None, arg1=None)`
+- `wait_all(handles)`
+- `cleanup_finished(handles)`
+- `shard_rows(size, workers)`
+- `stage_barrier(name)`
+
+当前阶段汇合策略：
+
+- 各并行区域在区域内使用 `wait_all(handles)` 汇合。
+- `wait_all(handles)` 现会使用 `has_finished()` 统计“已完成/需等待”句柄，并输出 `drone_wait` 日志。
+- 主循环在南瓜、向日葵、仙人掌、补给、解锁后输出 `stage_barrier`，用于确认是否存在跨阶段残留无人机。
+- 主循环会输出 `parallel_rollout <name> level <n>`，便于确认当前灰度档位。
+
+说明：`spawn_drone()` 有显著 tick 成本，因此分片按行/子区，不按单格 spawn。
+
+## simulate 仿真说明（当前仅文档保留）
+
+当前状态：
+
+- simulate 功能已解锁，但当前农场规模尚不需要模拟流程。
+- 本项目暂不保留模拟实现代码文件，仅保留此章节说明，后续规模扩大再启用。
+
+建议使用时机（未来）：
+
+- 农场规模进一步扩大，单轮维护时间显著增长。
+- 并行区域扩展到 supply 之外，需要批量回归策略。
+- 迷宫/恐龙模式进入高频切换阶段，需要重复可复现实验。
+
+保留的模拟参数说明：
+
+- `filename`: 指定模拟起始文件。
+- `sim_unlocks`: 指定模拟解锁状态。
+- `sim_items`: 指定模拟初始物资。
+- `sim_globals`: 指定模拟全局变量。
+- `seed`: 固定或随机种子。
+- `speedup`: 模拟加速倍数。
+
+说明：
+
+- simulate 不改变真实农场状态，适合后续做性能回归。
+- 当前阶段以真实农场灰度观察为主，simulate 暂不进入执行链路。
+
+## 下一步进展（已开始）
+
+- 已新增 `farm_layout.py`，用于承载布局常量与区域判定。
+- `farm_utils.py` 已改为从 `farm_layout.py` 引用布局定义。
+- 已实现 `zone_at(x, y)` 与 `target_entity_at(x, y)` 作为布局统一入口。
+- `farm_zones.py` 的补给维护与补给计数已改为通过 `zone_at` 判定，不再依赖硬编码 y 分段。
+- 向日葵、迷宫、仙人掌维护入口已接入布局接口（`zone_at` / `target_entity_at`）。
+- 已实现 `tree_allowed_at(x, y)` 的棋盘树位规则（树区内仅允许一半格作为树目标位）。
+- 补给区已改为布局驱动混种：`target_entity_at` 在胡萝卜/树/灌木区生成受控混种目标。
+- 已新增树位命中率日志：`tree_slots allowed <n> total <n>`，用于观察树位规则覆盖率。
+- 已新增 `scan_rect()` 通用蛇形扫描，并接入补给区串行/并行维护路径以降低移动跳转开销。
+- 后续将继续把更多布局策略职责从工具层迁移到布局层。
 
 ## 下一次最可能要继续处理的问题
 
@@ -834,7 +989,7 @@ def maintain_sunflower_zone():
 
 #### 方案 A：全图蛇形扫描
 
-每轮从 `(0,0)` 开始按蛇形扫完整个 12x12。
+每轮从 `(0,0)` 开始按蛇形扫完整个 16x16。
 
 每个格子调用：
 
@@ -926,13 +1081,35 @@ handle_zone_tile(zone)
 
 建议下一步先做方案 A，验证恐龙帽、苹果、骨头收益完整闭环，再考虑追苹果优化。
 
+当前实现状态：
+
+- 已新增独立入口文件 `dino_mode.py`。
+- 当前版本支持独立恐龙循环，也可从合并入口先运行恐龙模式后再回到农场主循环。
+- 当前实现采用“方案 A：固定蛇形填满农场”的最小闭环版本：
+  1. 检查是否有仙人掌库存。
+  2. `clear()` 清场。
+  3. `change_hat(Hats.Dinosaur_Hat)`。
+  4. 执行固定蛇形走位。
+  5. `change_hat(Hats.Straw_Hat)` 收骨头。
+  6. 若是合并入口，则在恐龙循环后回到农场主循环。
+- 当前版本目标是验证闭环，不做追苹果优化，也不与多无人机并发运行。
+
 ## 下一阶段建议提交顺序
 
-1. 新建 `farm_layout.py`，迁移布局常量和 `is_*_zone()`。
-2. 实现 `zone_at(x, y)` 和 `target_entity_at(x, y)`。
-3. 重写补给区为混合种植 + 树不相邻布局。
-4. 简化向日葵：全部成熟即收，收后立刻补种。
-5. 把仙人掌区先缩到 3x3，验证二维冒泡排序。
-6. 把迷宫 DFS 改成目标导向 DFS。
-7. 添加 `scan_rect()`，优化区域内部巡田路线。
-8. 新增独立恐龙模式：先清场，装备恐龙帽，使用非环绕蛇形路径吃苹果，卸帽收骨头，再重建混合农场。
+1. 已完成：新建 `farm_layout.py`，迁移布局常量和 `is_*_zone()`。
+2. 已完成：实现 `zone_at(x, y)` 和 `target_entity_at(x, y)`。
+3. 已完成：补给区维护与计数改为布局接口判定。
+4. 已完成：向日葵简化为成熟即收、收后立刻补种。
+5. 进行中：逐步将更多区域入口改为布局接口（迷宫、仙人掌已接入，南瓜深层逻辑待继续抽象）。
+6. 已完成：实现树不相邻布局规则（基于 `tree_allowed_at`），并落地补给区混合种植策略。
+7. 进行中：仙人掌区已缩到 3x3 进行排序稳定性验证（通过布局常量切换）。
+8. 已完成：迷宫 DFS 已改为目标导向 DFS（优先尝试更接近宝藏坐标的方向）。
+9. 已完成：添加 `scan_rect()`，并接入补给区巡田路线优化。
+10. 新增：多无人机实现清单（按风险从低到高）
+11. 第 1 步：补给区并行继续打磨（当前已上线），持续观察 `drone_spawn`、`drone_tasks_inflight`、`supply_maintain`。
+12. 已完成：南瓜“逐格维护”并行化，南瓜收割判定保持串行。
+13. 已完成：向日葵“逐格维护”并行化，收割决策保持串行。
+14. 已完成：引入 `wait_for`/`has_finished` 的阶段汇合点与 `stage_barrier` 日志，避免并暴露跨阶段悬挂任务。
+15. 已完成：增加竞态防护日志（当前先覆盖水/肥重复写风险命中日志）。
+16. 已完成：加入并行灰度开关分级（`supply-only` -> `supply+pumpkin` -> `supply+pumpkin+sunflower`）。
+17. 已完成：新增独立恐龙模式闭环骨架（不接入主循环，不与并发改造混跑）。
